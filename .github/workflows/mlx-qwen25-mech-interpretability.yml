@@ -118,7 +118,9 @@ jobs:
                   item["detail"] = detail
               if error is not None:
                   item["error"] = str(error)
+
               RESULTS.append(item)
+
               print(("PASS" if ok else "FAIL") + f" :: {name}")
               if detail:
                   print(json.dumps(detail, indent=2, default=str)[:4000])
@@ -140,6 +142,7 @@ jobs:
           def test_imports():
               import mlx
               import mlx_lm
+
               return {
                   "platform": platform.platform(),
                   "machine": platform.machine(),
@@ -183,6 +186,7 @@ jobs:
 
           def ids_array(text):
               import mlx.core as mx
+
               ids = encode(text)
               return mx.array([ids], dtype=mx.int32), ids
 
@@ -208,6 +212,7 @@ jobs:
                   raise IndexError(f"Patch position {pos} outside sequence length {seq_len}")
 
               rep = replacement
+
               if len(rep.shape) == 1:
                   rep = rep.reshape(1, 1, -1)
               elif len(rep.shape) == 2:
@@ -237,7 +242,12 @@ jobs:
 
                   if mode == "zero":
                       import mlx.core as mx
-                      z = mx.zeros_like(value[:, pos:pos + 1, :]) if pos >= 0 else mx.zeros_like(value[:, -1:, :])
+
+                      if pos >= 0:
+                          z = mx.zeros_like(value[:, pos:pos + 1, :])
+                      else:
+                          z = mx.zeros_like(value[:, -1:, :])
+
                       return replacement_at_position(value, z, pos=pos)
 
                   if mode == "add":
@@ -291,6 +301,7 @@ jobs:
               h_final = model.model.norm(h)
               logits = lm_head(model, h_final)
               mx.eval(logits)
+
               return logits, traces
 
           def token_rank(logits_vec, token_id):
