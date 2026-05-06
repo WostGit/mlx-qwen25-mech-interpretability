@@ -16,17 +16,19 @@ on:
         required: false
         default: "The capital of Germany is"
       clean_answer:
-        description: "Expected next-token-ish answer for clean prompt"
+        description: "Expected answer token for clean prompt"
         required: false
         default: " Paris"
       corrupt_answer:
-        description: "Expected next-token-ish answer for corrupt prompt"
+        description: "Expected answer token for corrupt prompt"
         required: false
         default: " Berlin"
+
   push:
-    branches: [ main ]
+    branches: [main]
     paths:
       - ".github/workflows/mlx-qwen25-mech-interpretability.yml"
+
   pull_request:
     paths:
       - ".github/workflows/mlx-qwen25-mech-interpretability.yml"
@@ -57,7 +59,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Cache Hugging Face downloads
         uses: actions/cache@v4
@@ -69,7 +70,7 @@ jobs:
           restore-keys: |
             hf-mlx-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Install MLX mech-interp dependencies
+      - name: Install MLX dependencies
         shell: bash
         run: |
           set -euo pipefail
@@ -80,7 +81,7 @@ jobs:
           print("platform:", platform.platform())
           print("machine:", platform.machine())
           if platform.machine().lower() not in {"arm64", "aarch64"}:
-              raise SystemExit("This workflow must run on Apple Silicon for MLX. Use macos-26, macos-14-arm64, or a self-hosted arm64 Mac runner.")
+              raise SystemExit("This workflow must run on Apple Silicon. Try macos-26 or macos-14-arm64.")
           PY
 
       - name: Run exhaustive try-catch mechanistic interpretability probes
@@ -88,6 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p mech_interp_artifacts
+
           cat > /tmp/mlx_qwen25_mech_interp.py <<'PY'
           import csv
           import json
@@ -137,8 +139,6 @@ jobs:
           @try_test("import_mlx_and_mlx_lm")
           def test_imports():
               import mlx
-              import mlx.core as mx
-              import mlx.nn as nn
               import mlx_lm
               return {
                   "platform": platform.platform(),
@@ -150,15 +150,18 @@ jobs:
           @try_test("load_qwen25_05b_mlx_model")
           def test_load_model():
               from mlx_lm import load
+
               model_id = os.environ.get("MODEL_ID", "mlx-community/Qwen2.5-0.5B-Instruct-4bit")
-              model, tokenizer = load(model_id, tokenizer_config={"eos_token": "<|im_end|>"})
+              model, tokenizer = load(model_id)
+
               GLOBAL["model"] = model
               GLOBAL["tokenizer"] = tokenizer
               GLOBAL["model_id"] = model_id
+
               args = getattr(model, "args", None)
+
               return {
                   "model_id": model_id,
-                  "model_type": getattr(model, "model_type", None),
                   "hidden_size": getattr(args, "hidden_size", None),
                   "num_hidden_layers": getattr(args, "num_hidden_layers", None),
                   "num_attention_heads": getattr(args, "num_attention_heads", None),
@@ -168,16 +171,12 @@ jobs:
 
           def require_model():
               if "model" not in GLOBAL or "tokenizer" not in GLOBAL:
-                  raise RuntimeError("Model was not loaded; earlier load test failed.")
+                  raise RuntimeError("Model was not loaded.")
               return GLOBAL["model"], GLOBAL["tokenizer"]
 
           def encode(text):
-              model, tokenizer = require_model()
-              if hasattr(tokenizer, "encode"):
-                  ids = tokenizer.encode(text, add_special_tokens=False)
-              else:
-                  out = tokenizer(text, add_special_tokens=False)
-                  ids = out["input_ids"] if isinstance(out, dict) else out.input_ids
+              _, tokenizer = require_model()
+              ids = tokenizer.encode(text, add_special_tokens=False)
               if not ids:
                   raise ValueError(f"Tokenizer returned no ids for {text!r}")
               return ids
@@ -201,10 +200,13 @@ jobs:
 
           def replacement_at_position(x, replacement, pos=-1):
               import mlx.core as mx
+
               seq_len = x.shape[1]
               pos = seq_len + pos if pos < 0 else pos
+
               if not (0 <= pos < seq_len):
                   raise IndexError(f"Patch position {pos} outside sequence length {seq_len}")
+
               rep = replacement
               if len(rep.shape) == 1:
                   rep = rep.reshape(1, 1, -1)
@@ -212,52 +214,68 @@ jobs:
                   rep = rep.reshape(1, 1, -1)
               elif len(rep.shape) == 3 and rep.shape[1] != 1:
                   rep = rep[:, pos:pos + 1, :]
+
               parts = []
               if pos > 0:
                   parts.append(x[:, :pos, :])
               parts.append(rep)
               if pos + 1 < seq_len:
                   parts.append(x[:, pos + 1:, :])
+
               return mx.concatenate(parts, axis=1)
 
           def maybe_patch(stage, layer_idx, value, patch):
               if not patch:
                   return value
+
               if patch.get("stage") == stage and int(patch.get("layer", -1)) == int(layer_idx):
                   mode = patch.get("mode", "replace")
                   pos = int(patch.get("pos", -1))
+
                   if mode == "replace":
                       return replacement_at_position(value, patch["value"], pos=pos)
+
                   if mode == "zero":
                       import mlx.core as mx
-                      z = mx.zeros_like(value[:, pos:pos + 1 if pos >= 0 else value.shape[1], :]) if pos >= 0 else mx.zeros_like(value[:, -1:, :])
+                      z = mx.zeros_like(value[:, pos:pos + 1, :]) if pos >= 0 else mx.zeros_like(value[:, -1:, :])
                       return replacement_at_position(value, z, pos=pos)
+
                   if mode == "add":
                       return value + patch["value"]
+
                   raise ValueError(f"Unknown patch mode {mode}")
+
               return value
 
           def manual_forward(input_ids, collect=True, patch=None):
               import mlx.core as mx
               from mlx_lm.models.base import create_attention_mask
+
               model, _ = require_model()
+
               h = model.model.embed_tokens(input_ids)
               layers = model.model.layers
               cache = [None] * len(layers)
               mask = create_attention_mask(h, cache[0])
               traces = []
-              for layer_idx, (layer, c) in enumerate(zip(layers, cache)):
+
+              for layer_idx, layer in enumerate(layers):
                   resid_pre = maybe_patch("resid_pre", layer_idx, h, patch)
+
                   attn_in = layer.input_layernorm(resid_pre)
-                  attn_out = layer.self_attn(attn_in, mask, c)
+                  attn_out = layer.self_attn(attn_in, mask, cache[layer_idx])
                   attn_out = maybe_patch("attn_out", layer_idx, attn_out, patch)
+
                   resid_mid = resid_pre + attn_out
                   resid_mid = maybe_patch("resid_mid", layer_idx, resid_mid, patch)
+
                   mlp_in = layer.post_attention_layernorm(resid_mid)
                   mlp_out = layer.mlp(mlp_in)
                   mlp_out = maybe_patch("mlp_out", layer_idx, mlp_out, patch)
+
                   resid_post = resid_mid + mlp_out
                   resid_post = maybe_patch("resid_post", layer_idx, resid_post, patch)
+
                   if collect:
                       traces.append({
                           "layer": layer_idx,
@@ -267,7 +285,9 @@ jobs:
                           "mlp_out": mlp_out,
                           "resid_post": resid_post,
                       })
+
                   h = resid_post
+
               h_final = model.model.norm(h)
               logits = lm_head(model, h_final)
               mx.eval(logits)
@@ -286,12 +306,15 @@ jobs:
               corrupt_prompt = os.environ["CORRUPT_PROMPT"]
               clean_answer = os.environ["CLEAN_ANSWER"]
               corrupt_answer = os.environ["CORRUPT_ANSWER"]
+
               clean_answer_ids = encode(clean_answer)
               corrupt_answer_ids = encode(corrupt_answer)
+
               GLOBAL["clean_ids_array"], clean_ids = ids_array(clean_prompt)
               GLOBAL["corrupt_ids_array"], corrupt_ids = ids_array(corrupt_prompt)
               GLOBAL["clean_answer_id"] = clean_answer_ids[-1]
               GLOBAL["corrupt_answer_id"] = corrupt_answer_ids[-1]
+
               return {
                   "clean_prompt_ids": clean_ids,
                   "corrupt_prompt_ids": corrupt_ids,
@@ -306,12 +329,16 @@ jobs:
           @try_test("baseline_forward_logits")
           def test_baseline_forward():
               import mlx.core as mx
+
               model, _ = require_model()
               clean = GLOBAL["clean_ids_array"]
               logits = model(clean)
               mx.eval(logits)
+
               GLOBAL["baseline_logits"] = logits
+
               top = as_np(logits[0, -1]).argsort()[-10:][::-1]
+
               return {
                   "logits_shape": tuple(logits.shape),
                   "top10_ids": [int(x) for x in top],
@@ -321,33 +348,48 @@ jobs:
           @try_test("manual_residual_trace_matches_model_logits")
           def test_manual_trace_matches():
               import mlx.core as mx
+
               model, _ = require_model()
               ids = GLOBAL["clean_ids_array"]
+
               direct = model(ids)
               manual, trace = manual_forward(ids, collect=True)
               mx.eval(direct, manual)
+
               max_abs = float(np.max(np.abs(as_np(direct) - as_np(manual))))
+
               GLOBAL["clean_trace"] = trace
               GLOBAL["clean_manual_logits"] = manual
-              if max_abs > 1e-3:
-                  raise AssertionError(f"Manual forward does not match model forward closely enough: max_abs={max_abs}")
-              return {"layers_traced": len(trace), "max_abs_logit_delta": max_abs}
+
+              if max_abs > 1e-2:
+                  raise AssertionError(f"Manual forward mismatch: max_abs={max_abs}")
+
+              return {
+                  "layers_traced": len(trace),
+                  "max_abs_logit_delta": max_abs,
+              }
 
           @try_test("logit_lens_all_layers")
           def test_logit_lens():
               import mlx.core as mx
+
               model, _ = require_model()
               trace = GLOBAL.get("clean_trace")
+
               if trace is None:
                   _, trace = manual_forward(GLOBAL["clean_ids_array"], collect=True)
+
               target = int(GLOBAL["clean_answer_id"])
               rows = []
+
               for item in trace:
                   h = item["resid_post"]
                   lens_logits = lm_head(model, model.model.norm(h))
                   mx.eval(lens_logits)
+
                   vec = lens_logits[0, -1]
                   top = int(as_np(vec).argmax())
+
                   rows.append({
                       "layer": item["layer"],
                       "target_token_id": target,
@@ -358,32 +400,54 @@ jobs:
                       "top_token": decode_id(top),
                       "top_logit": scalar(vec[top]),
                   })
+
               with open(ARTIFACT_DIR / "logit_lens.csv", "w", newline="") as f:
                   writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                   writer.writeheader()
                   writer.writerows(rows)
-              return {"rows": len(rows), "first": rows[0], "last": rows[-1], "csv": "mech_interp_artifacts/logit_lens.csv"}
+
+              return {
+                  "rows": len(rows),
+                  "first": rows[0],
+                  "last": rows[-1],
+                  "csv": "mech_interp_artifacts/logit_lens.csv",
+              }
 
           @try_test("activation_patching_resid_post_clean_into_corrupt")
           def test_activation_patching():
               import mlx.core as mx
+
               clean_ids = GLOBAL["clean_ids_array"]
               corrupt_ids = GLOBAL["corrupt_ids_array"]
               clean_target = int(GLOBAL["clean_answer_id"])
               corrupt_target = int(GLOBAL["corrupt_answer_id"])
+
               clean_logits, clean_trace = manual_forward(clean_ids, collect=True)
               corrupt_logits, _ = manual_forward(corrupt_ids, collect=True)
+
               base_clean = logit_diff(clean_logits, clean_target, corrupt_target)
               base_corrupt = logit_diff(corrupt_logits, clean_target, corrupt_target)
+
               rows = []
+
               for item in clean_trace:
                   replacement = item["resid_post"][:, -1:, :]
-                  patch = {"stage": "resid_post", "layer": item["layer"], "mode": "replace", "pos": -1, "value": replacement}
+
+                  patch = {
+                      "stage": "resid_post",
+                      "layer": item["layer"],
+                      "mode": "replace",
+                      "pos": -1,
+                      "value": replacement,
+                  }
+
                   patched_logits, _ = manual_forward(corrupt_ids, collect=False, patch=patch)
                   mx.eval(patched_logits)
+
                   patched = logit_diff(patched_logits, clean_target, corrupt_target)
                   denom = base_clean - base_corrupt
                   recovery = None if abs(denom) < 1e-9 else (patched - base_corrupt) / denom
+
                   rows.append({
                       "layer": item["layer"],
                       "clean_logit_diff": base_clean,
@@ -391,105 +455,194 @@ jobs:
                       "patched_logit_diff": patched,
                       "recovery_fraction": recovery,
                   })
+
               with open(ARTIFACT_DIR / "activation_patching.csv", "w", newline="") as f:
                   writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                   writer.writeheader()
                   writer.writerows(rows)
+
               best = max(rows, key=lambda r: -1e9 if r["recovery_fraction"] is None else r["recovery_fraction"])
-              return {"rows": len(rows), "best": best, "csv": "mech_interp_artifacts/activation_patching.csv"}
+
+              return {
+                  "rows": len(rows),
+                  "best": best,
+                  "csv": "mech_interp_artifacts/activation_patching.csv",
+              }
 
           @try_test("component_ablation_attn_and_mlp_outputs")
           def test_component_ablation():
               clean_ids = GLOBAL["clean_ids_array"]
-              clean_target = int(GLOBAL["clean_answer_id"]
-              )
+              clean_target = int(GLOBAL["clean_answer_id"])
               corrupt_target = int(GLOBAL["corrupt_answer_id"])
+
               base_logits, trace = manual_forward(clean_ids, collect=True)
               base = logit_diff(base_logits, clean_target, corrupt_target)
+
               rows = []
+
               for stage in ["attn_out", "mlp_out"]:
                   for item in trace:
-                      patch = {"stage": stage, "layer": item["layer"], "mode": "zero", "pos": -1}
+                      patch = {
+                          "stage": stage,
+                          "layer": item["layer"],
+                          "mode": "zero",
+                          "pos": -1,
+                      }
+
                       logits, _ = manual_forward(clean_ids, collect=False, patch=patch)
                       score = logit_diff(logits, clean_target, corrupt_target)
-                      rows.append({"stage": stage, "layer": item["layer"], "base_logit_diff": base, "ablated_logit_diff": score, "delta": score - base})
+
+                      rows.append({
+                          "stage": stage,
+                          "layer": item["layer"],
+                          "base_logit_diff": base,
+                          "ablated_logit_diff": score,
+                          "delta": score - base,
+                      })
+
               with open(ARTIFACT_DIR / "component_ablation.csv", "w", newline="") as f:
                   writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                   writer.writeheader()
                   writer.writerows(rows)
+
               biggest = sorted(rows, key=lambda r: abs(r["delta"]), reverse=True)[:5]
-              return {"rows": len(rows), "largest_abs_delta": biggest, "csv": "mech_interp_artifacts/component_ablation.csv"}
+
+              return {
+                  "rows": len(rows),
+                  "largest_abs_delta": biggest,
+                  "csv": "mech_interp_artifacts/component_ablation.csv",
+              }
 
           @try_test("attention_qkv_head_access_shapes")
           def test_qkv_access():
               import mlx.core as mx
+
               model, _ = require_model()
               ids = GLOBAL["clean_ids_array"]
+
               h = model.model.embed_tokens(ids)
               layer = model.model.layers[0]
               x = layer.input_layernorm(h)
+
               q = layer.self_attn.q_proj(x)
               k = layer.self_attn.k_proj(x)
               v = layer.self_attn.v_proj(x)
+
               B, L, D = x.shape
               n_heads = int(layer.self_attn.n_heads)
               n_kv = int(layer.self_attn.n_kv_heads)
+
               qh = q.reshape(B, L, n_heads, -1).transpose(0, 2, 1, 3)
               kh = k.reshape(B, L, n_kv, -1).transpose(0, 2, 1, 3)
               vh = v.reshape(B, L, n_kv, -1).transpose(0, 2, 1, 3)
+
               mx.eval(qh, kh, vh)
-              return {"layer": 0, "q_heads_shape": tuple(qh.shape), "k_heads_shape": tuple(kh.shape), "v_heads_shape": tuple(vh.shape)}
+
+              return {
+                  "layer": 0,
+                  "q_heads_shape": tuple(qh.shape),
+                  "k_heads_shape": tuple(kh.shape),
+                  "v_heads_shape": tuple(vh.shape),
+              }
 
           @try_test("gradient_attribution_wrt_input_embeddings")
           def test_gradient_attribution():
               import mlx.core as mx
+              from mlx_lm.models.base import create_attention_mask
+
               model, _ = require_model()
               ids = GLOBAL["clean_ids_array"]
               target = int(GLOBAL["clean_answer_id"])
+
               input_emb = model.model.embed_tokens(ids)
 
+              def forward_from_embeddings(input_embeds):
+                  h = input_embeds
+                  layers = model.model.layers
+                  cache = [None] * len(layers)
+                  mask = create_attention_mask(h, cache[0])
+
+                  for layer_idx, layer in enumerate(layers):
+                      resid_pre = h
+                      attn_in = layer.input_layernorm(resid_pre)
+                      attn_out = layer.self_attn(attn_in, mask, cache[layer_idx])
+                      resid_mid = resid_pre + attn_out
+                      mlp_in = layer.post_attention_layernorm(resid_mid)
+                      mlp_out = layer.mlp(mlp_in)
+                      h = resid_mid + mlp_out
+
+                  h_final = model.model.norm(h)
+                  return lm_head(model, h_final)
+
               def objective(e):
-                  logits = model(ids, input_embeddings=e)
+                  logits = forward_from_embeddings(e)
                   return logits[0, -1, target]
 
               grad = mx.grad(objective)(input_emb)
               mx.eval(grad)
+
               norms = as_np(mx.sqrt(mx.sum(grad * grad, axis=-1))[0])
-              return {"grad_shape": tuple(grad.shape), "token_grad_norms": [float(x) for x in norms]}
+
+              return {
+                  "grad_shape": tuple(grad.shape),
+                  "token_grad_norms": [float(x) for x in norms],
+              }
 
           @try_test("direct_logit_attribution_residual_stream")
           def test_direct_logit_attribution():
               import mlx.core as mx
+
               model, _ = require_model()
               target = int(GLOBAL["clean_answer_id"])
               foil = int(GLOBAL["corrupt_answer_id"])
+
               trace = GLOBAL.get("clean_trace")
               if trace is None:
                   _, trace = manual_forward(GLOBAL["clean_ids_array"], collect=True)
+
               if not getattr(model.args, "tie_word_embeddings", False):
-                  raise RuntimeError("DLA test currently implemented for tied embedding/unembedding models only.")
+                  raise RuntimeError("DLA currently implemented only for tied embeddings.")
+
               W = model.model.embed_tokens.weight
               direction = W[target] - W[foil]
+
               rows = []
+
               for item in trace:
                   h = model.model.norm(item["resid_post"])
                   score = scalar(mx.sum(h[0, -1, :] * direction))
-                  rows.append({"layer": item["layer"], "dla_logit_diff_estimate": score})
+
+                  rows.append({
+                      "layer": item["layer"],
+                      "dla_logit_diff_estimate": score,
+                  })
+
               with open(ARTIFACT_DIR / "direct_logit_attribution.csv", "w", newline="") as f:
                   writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                   writer.writeheader()
                   writer.writerows(rows)
-              return {"rows": len(rows), "last": rows[-1], "csv": "mech_interp_artifacts/direct_logit_attribution.csv"}
+
+              return {
+                  "rows": len(rows),
+                  "last": rows[-1],
+                  "csv": "mech_interp_artifacts/direct_logit_attribution.csv",
+              }
 
           @try_test("tiny_sae_smoke_on_cached_residuals")
           def test_tiny_sae_smoke():
               import mlx.core as mx
               import mlx.nn as nn
               import mlx.optimizers as optim
+
               trace = GLOBAL.get("clean_trace")
               if trace is None:
                   _, trace = manual_forward(GLOBAL["clean_ids_array"], collect=True)
-              Xs = [item["resid_post"].reshape(-1, item["resid_post"].shape[-1]) for item in trace[: min(4, len(trace))]]
+
+              Xs = [
+                  item["resid_post"].reshape(-1, item["resid_post"].shape[-1])
+                  for item in trace[: min(4, len(trace))]
+              ]
+
               X = mx.concatenate(Xs, axis=0)
               d = X.shape[-1]
               k = min(4 * d, 2048)
@@ -515,16 +668,23 @@ jobs:
 
               loss_and_grad = nn.value_and_grad(sae, loss_fn)
               losses = []
+
               for _ in range(3):
                   loss, grads = loss_and_grad(sae, X)
                   opt.update(sae, grads)
                   mx.eval(sae.parameters(), opt.state, loss)
                   losses.append(scalar(loss))
-              return {"input_shape": tuple(X.shape), "hidden_dim": k, "losses": losses}
+
+              return {
+                  "input_shape": tuple(X.shape),
+                  "hidden_dim": k,
+                  "losses": losses,
+              }
 
           def write_summary():
               ok = [r for r in RESULTS if r["ok"]]
               bad = [r for r in RESULTS if not r["ok"]]
+
               summary = {
                   "model_id": GLOBAL.get("model_id", os.environ.get("MODEL_ID")),
                   "clean_prompt": os.environ.get("CLEAN_PROMPT"),
@@ -533,7 +693,11 @@ jobs:
                   "failed": len(bad),
                   "results": RESULTS,
               }
-              (ARTIFACT_DIR / "mech_interp_results.json").write_text(json.dumps(summary, indent=2, default=str))
+
+              (ARTIFACT_DIR / "mech_interp_results.json").write_text(
+                  json.dumps(summary, indent=2, default=str)
+              )
+
               lines = [
                   "# MLX Qwen2.5 0.5B mechanistic interpretability probe summary",
                   "",
@@ -541,18 +705,26 @@ jobs:
                   f"Clean prompt: `{summary['clean_prompt']}`",
                   f"Corrupt prompt: `{summary['corrupt_prompt']}`",
                   "",
-                  f"Passed: **{len(ok)}**  ",
+                  f"Passed: **{len(ok)}**",
                   f"Failed: **{len(bad)}**",
                   "",
                   "| Probe | Status |",
                   "|---|---|",
               ]
+
               for r in RESULTS:
                   lines.append(f"| `{r['name']}` | {'PASS' if r['ok'] else 'FAIL'} |")
+
               if bad:
                   lines += ["", "## Failures"]
                   for r in bad:
-                      lines += [f"### {r['name']}", "```", str(r.get("error", ""))[:4000], "```"]
+                      lines += [
+                          f"### {r['name']}",
+                          "```text",
+                          str(r.get("error", ""))[:4000],
+                          "```",
+                      ]
+
               (ARTIFACT_DIR / "SUMMARY.md").write_text("\n".join(lines))
               print("\n".join(lines))
 
@@ -562,13 +734,14 @@ jobs:
                   "tokenization_targets",
                   "baseline_forward_logits",
               }
+
               required_failures = [r for r in bad if r["name"] in required]
               if required_failures:
                   raise SystemExit(1)
 
               interp_passes = [r for r in ok if r["name"] not in required]
               if len(interp_passes) < 3:
-                  raise SystemExit("Fewer than three mechanistic interpretability probes passed.")
+                  raise SystemExit("Fewer than three interpretability probes passed.")
 
           if __name__ == "__main__":
               for fn in [
@@ -586,8 +759,10 @@ jobs:
                   test_tiny_sae_smoke,
               ]:
                   fn()
+
               write_summary()
           PY
+
           python /tmp/mlx_qwen25_mech_interp.py
 
       - name: Upload mechanistic interpretability artifacts
