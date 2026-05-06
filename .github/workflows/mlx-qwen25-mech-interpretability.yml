@@ -600,21 +600,21 @@ jobs:
               if trace is None:
                   _, trace = manual_forward(GLOBAL["clean_ids_array"], collect=True)
 
-              if not getattr(model.args, "tie_word_embeddings", False):
-                  raise RuntimeError("DLA currently implemented only for tied embeddings.")
-
-              W = model.model.embed_tokens.weight
-              direction = W[target] - W[foil]
-
               rows = []
 
               for item in trace:
                   h = model.model.norm(item["resid_post"])
-                  score = scalar(mx.sum(h[0, -1, :] * direction))
+                  target_logits = lm_head(model, h)
+                  mx.eval(target_logits)
+
+                  clean_logit = scalar(target_logits[0, -1, target])
+                  foil_logit = scalar(target_logits[0, -1, foil])
 
                   rows.append({
                       "layer": item["layer"],
-                      "dla_logit_diff_estimate": score,
+                      "target_logit": clean_logit,
+                      "foil_logit": foil_logit,
+                      "logit_diff": clean_logit - foil_logit,
                   })
 
               with open(ARTIFACT_DIR / "direct_logit_attribution.csv", "w", newline="") as f:
@@ -626,6 +626,7 @@ jobs:
                   "rows": len(rows),
                   "last": rows[-1],
                   "csv": "mech_interp_artifacts/direct_logit_attribution.csv",
+                  "note": "Uses layerwise residual logit-diff lens; works for tied and untied unembedding models.",
               }
 
           @try_test("tiny_sae_smoke_on_cached_residuals")
