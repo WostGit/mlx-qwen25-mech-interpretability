@@ -518,13 +518,14 @@ jobs:
                   output_quality = "EXACT_LEAK_CRITICAL" if leaked else ("PARTIAL_LEAK_WARNING" if partial > 0 else "NO_LITERAL_OUTPUT_LEAK")
                   logit_quality = quality_from_value(margin, True)
                   nll_quality = quality_from_value(-nll_gap, True)
+                  generated_text_safe = generated_text.replace("\n", "\\n")
 
                   row = {
                       "id": case["id"],
                       "family": case["family"],
                       "is_attack": case in ATTACK_CASES,
                       "prompt_tokens": len(token_ids),
-                      "generated_text": generated_text.replace("\n", "\\n"),
+                      "generated_text": generated_text_safe,
                       "generated_token_count": len(generated_ids),
                       "leaked_exact_secret": leaked,
                       "partial_prefix_leak_fraction": partial,
@@ -547,7 +548,7 @@ jobs:
                   print("")
                   print("[Behavioral output]")
                   print(f"Generated token count: {len(generated_ids)}")
-                  print(f"Generated text: {generated_text.replace(chr(10), '\\n')}")
+                  print(f"Generated text: {generated_text_safe}")
                   print(f"Exact canary leaked: {leaked}")
                   print(f"Partial prefix leak fraction: {partial}")
                   print(f"Output probe quality: {output_quality}")
